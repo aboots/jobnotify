@@ -4,6 +4,30 @@
 
 The checker runs on the machine where the jobs run. It uses only the Python standard library.
 
+The minute-by-minute checker is installed once per machine. Each experiment still needs one `jobnotify watch` so the alert can name that set of jobs. Jobs that were never registered do not send a message.
+
+## For an agent on a new server
+
+1. Clone and install:
+
+```bash
+git clone git@github.com:aboots/jobnotify.git
+cd jobnotify
+./install.sh
+```
+
+2. A fresh `~/.config/jobnotify/config.env` has no channel, so install alone does not deliver alerts. Reuse the existing `NTFY_SERVER` and `NTFY_TOPIC` from a machine that already notifies this user. Copy those two lines only. Create a new topic only when the user asks, and then give them the `https://ntfy.sh/<topic>` URL so they can subscribe.
+3. Keep `config.env` mode `600`. Do not commit it, and do not write the topic into the repo.
+4. `jobnotify channels` must show at least one ready channel. `jobnotify test` must succeed before you rely on it.
+5. After every `sbatch`, register that experiment once. The timer is already running; do not reinstall per experiment.
+
+```bash
+jobnotify watch JOBID [JOBID ...] --name "short protocol name"
+jobnotify list
+```
+
+6. One alert is sent when every registered id in that name has finished. Adding later ids to the same name keeps them in the same alert.
+
 ## Install
 
 ```bash

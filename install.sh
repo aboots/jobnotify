@@ -79,4 +79,5 @@ if [[ -f "${BASHRC}" ]] && ! grep -q 'jobnotify-path\|\.local/bin' "${BASHRC}"; 
 fi
 
 echo "Installed ${HOME_DIR}/.local/bin/jobnotify"
-echo "Next: edit ~/.config/jobnotify/config.env and run jobnotify test"
+echo "Subscribe to this topic in the ntfy app:"
+"${HOME_DIR}/.local/bin/jobnotify" ensure-topic

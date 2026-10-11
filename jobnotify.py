@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import shutil
 import smtplib
 import socket
@@ -22,7 +23,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Mapping
@@ -57,6 +58,7 @@ HARD_FAILURES = {
 }
 MISSING_POLLS = 3
 ABSENT_POLLS = 2
+DEFAULT_QUIET_MINUTES = 10
 FIELD_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)=(.*?)(?=\s+[A-Za-z][A-Za-z0-9]*=|$)")
 ARRAY_META_RE = re.compile(r"^\d+_\[")
 JOB_ID_RE = re.compile(r"^\d+$")
@@ -820,6 +822,113 @@ def deliver(protocol: dict, early: bool) -> bool:
     return False
 
 
+def base_job_id(task_id: str) -> str:
+    match = re.match(r"^(\d+)_\d+$", task_id)
+    if match:
+        return match.group(1)
+    return task_id
+
+
+def auto_enabled(cfg: Mapping[str, str]) -> bool:
+    return (cfg.get("AUTO_WATCH") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def quiet_minutes_setting(cfg: Mapping[str, str]) -> int:
+    try:
+        value = int(cfg.get("AUTO_QUIET_MINUTES") or DEFAULT_QUIET_MINUTES)
+    except ValueError:
+        return DEFAULT_QUIET_MINUTES
+    return max(1, value)
+
+
+def batch_display_name(batch: Mapping) -> str:
+    names: list[str] = []
+    for task in protocol_tasks(batch):
+        name = str(task.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        count = len(batch.get("job_ids") or [])
+        return f"{count} jobs" if count else "queue"
+    shown = ", ".join(names[:3])
+    if len(names) > 3:
+        shown += f" +{len(names) - 3}"
+    return shown
+
+
+def update_auto_batch(
+    batch: dict | None,
+    visible: list[dict],
+    now: datetime,
+    quiet_minutes: int,
+    scheduler_ok: bool,
+) -> tuple[dict | None, bool]:
+    """Track the user's live queue. Notify once it has been quiet and is empty.
+
+    A new batch starts when jobs are running or pending. Further job ids join
+    that batch. The alert waits until every tracked job is finished and no new
+    job has appeared for ``quiet_minutes``.
+    """
+    if not scheduler_ok:
+        return batch, False
+    running = [task for task in visible if not is_terminal(str(task.get("state", "")))]
+    if batch is None:
+        if not running:
+            return None, False
+        stamp = now.isoformat(timespec="seconds")
+        batch = {
+            "started": stamp,
+            "last_new_job": stamp,
+            "job_ids": [],
+            "tasks": {},
+            "name": "queue",
+            "kind": "auto",
+            "status": "watching",
+            "early_sent": True,
+            "missing_polls": {},
+        }
+        created = True
+    else:
+        created = False
+        batch.setdefault("tasks", {})
+        batch.setdefault("job_ids", [])
+    seen: set[str] = set()
+    new_ids = False
+    for task in visible:
+        task_id = str(task.get("id", ""))
+        if not task_id:
+            continue
+        seen.add(task_id)
+        base = base_job_id(task_id)
+        if base not in batch["job_ids"]:
+            batch["job_ids"].append(base)
+            if not is_terminal(str(task.get("state", ""))):
+                new_ids = True
+        batch["tasks"][task_id] = merge_task(batch["tasks"].get(task_id), task)
+    if new_ids and not created:
+        batch["last_new_job"] = now.isoformat(timespec="seconds")
+    for task_id, record in list(batch["tasks"].items()):
+        if task_id in seen or is_terminal(str(record.get("state", ""))):
+            continue
+        updated = dict(record)
+        updated["absent_polls"] = int(updated.get("absent_polls") or 0) + 1
+        if updated["absent_polls"] >= ABSENT_POLLS:
+            updated["state"] = "LEFT_QUEUE"
+            updated["reason"] = updated.get("reason") or "left the scheduler before an exit code was recorded"
+            updated["source"] = "missing"
+        batch["tasks"][task_id] = updated
+    batch["name"] = batch_display_name(batch)
+    stored = list(batch["tasks"].values())
+    all_terminal = bool(stored) and all(is_terminal(str(task.get("state", ""))) for task in stored)
+    last_new = datetime.fromisoformat(str(batch["last_new_job"]))
+    if last_new.tzinfo is None:
+        last_new = last_new.astimezone()
+    quiet = now - last_new >= timedelta(minutes=quiet_minutes)
+    if not running and all_terminal and quiet and batch["job_ids"]:
+        return batch, True
+    return batch, False
+
+
 def poll_protocol(protocol: dict) -> None:
     if protocol.get("status") != "watching":
         return
@@ -955,6 +1064,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_check(_: argparse.Namespace) -> int:
+    cfg = load_config()
     with StateStore() as store:
         for protocol in store.protocols():
             try:
@@ -962,14 +1072,42 @@ def cmd_check(_: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001 - one protocol must not block the others
                 protocol["last_error"] = str(exc)
                 log(f"check failed for {protocol.get('name')}: {exc}")
+        if not auto_enabled(cfg):
+            return 0
+        try:
+            visible, scheduler_ok = read_squeue()
+        except Exception as exc:  # noqa: BLE001
+            log(f"automatic queue check failed: {exc}")
+            return 0
+        batch, ready = update_auto_batch(
+            store.data.get("auto"),
+            visible,
+            datetime.now().astimezone(),
+            quiet_minutes_setting(cfg),
+            scheduler_ok,
+        )
+        store.data["auto"] = batch
+        if ready and batch is not None:
+            if deliver(batch, early=False):
+                history = store.data.setdefault("history", [])
+                history.append({"name": batch.get("name"), "finished_at": now_iso()})
+                store.data["history"] = history[-20:]
+                store.data["auto"] = None
     return 0
 
 
 def cmd_list(_: argparse.Namespace) -> int:
     with StateStore() as store:
+        auto = store.data.get("auto")
+        if auto:
+            tasks = protocol_tasks(auto)
+            summary = summarize(tasks) if tasks else "waiting for jobs"
+            print(f"{'watching':9} {auto.get('name')}  (automatic)")
+            print(f"          {summary}")
+            print("          alert when the queue is empty and no new job has appeared for the quiet period")
         protocols = store.protocols()
-        if not protocols:
-            print("No protocols are being watched.")
+        if not auto and not protocols:
+            print("No jobs are being watched.")
             return 0
         for protocol in protocols:
             tasks = protocol_tasks(protocol)
@@ -1005,6 +1143,48 @@ def cmd_channels(_: argparse.Namespace) -> int:
         print(f"{name:10} {'ready' if ready else 'unset'}")
     if cfg.get("SMTP_HOST") and cfg.get("SMTP_TO") and not cfg.get("SMTP_PASSWORD"):
         print("email password is still empty")
+    return 0
+
+
+def topic_url(cfg: Mapping[str, str]) -> str:
+    topic = (cfg.get("NTFY_TOPIC") or "").strip()
+    if not topic:
+        raise SystemExit("NTFY_TOPIC is not set")
+    if topic.startswith("http://") or topic.startswith("https://"):
+        return topic
+    server = (cfg.get("NTFY_SERVER") or "https://ntfy.sh").rstrip("/")
+    return f"{server}/{topic}"
+
+
+def cmd_link(_: argparse.Namespace) -> int:
+    print(topic_url(load_config()))
+    return 0
+
+
+def cmd_ensure_topic(_: argparse.Namespace) -> int:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_config() if path.is_file() else {}
+    topic = (existing.get("NTFY_TOPIC") or "").strip()
+    placeholder = "replace-with-a-long-random-string"
+    if topic and topic != placeholder:
+        print(topic_url(existing))
+        return 0
+    topic = "jobnotify-" + secrets.token_hex(18)
+    path.write_text(
+        "\n".join(
+            [
+                "NTFY_SERVER=https://ntfy.sh",
+                f"NTFY_TOPIC={topic}",
+                "AUTO_WATCH=1",
+                f"AUTO_QUIET_MINUTES={DEFAULT_QUIET_MINUTES}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    print(topic_url({"NTFY_SERVER": "https://ntfy.sh", "NTFY_TOPIC": topic}))
     return 0
 
 
@@ -1054,6 +1234,10 @@ def build_parser() -> argparse.ArgumentParser:
     channels.set_defaults(func=cmd_channels)
     test = sub.add_parser("test", help="Send a test alert")
     test.set_defaults(func=cmd_test)
+    link = sub.add_parser("link", help="Print the ntfy subscribe URL")
+    link.set_defaults(func=cmd_link)
+    ensure = sub.add_parser("ensure-topic", help="Create an ntfy topic when one is missing")
+    ensure.set_defaults(func=cmd_ensure_topic)
     self_test = sub.add_parser("self-test", help="Run internal checks")
     self_test.set_defaults(func=cmd_self_test)
     return parser
@@ -1207,6 +1391,42 @@ JobId=20056 ArrayJobId=20018 ArrayTaskId=2 JobName=v49-stageB
         self.assertEqual(title, "Jobs finished: V49 remaining")
         self.assertIn("Come check the results.", body)
         self.assertIn("v49-summary", body)
+
+    def test_auto_batch_waits_for_quiet_and_an_empty_queue(self) -> None:
+        start = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
+        running = [{"id": "20018_2", "name": "v49-stageB", "state": "RUNNING", "exit_code": "", "elapsed": "1:00", "reason": "", "source": "squeue"}]
+        batch, ready = update_auto_batch(None, running, start, 10, True)
+        self.assertIsNotNone(batch)
+        self.assertFalse(ready)
+        later = start + timedelta(minutes=3)
+        extra = running + [{"id": "20089", "name": "v49-stageB-f4", "state": "PENDING", "exit_code": "", "elapsed": "0:00", "reason": "", "source": "squeue"}]
+        batch, ready = update_auto_batch(batch, extra, later, 10, True)
+        self.assertFalse(ready)
+        self.assertEqual(batch["last_new_job"], later.isoformat(timespec="seconds"))
+        done_time = later + timedelta(minutes=11)
+        finished = [
+            {"id": "20018_2", "name": "v49-stageB", "state": "COMPLETED", "exit_code": "0:0", "elapsed": "2:00", "reason": "", "source": "squeue"},
+            {"id": "20089", "name": "v49-stageB-f4", "state": "COMPLETED", "exit_code": "0:0", "elapsed": "1:00", "reason": "", "source": "squeue"},
+        ]
+        batch, ready = update_auto_batch(batch, finished, done_time, 10, True)
+        self.assertTrue(ready)
+        self.assertIn("v49-stageB", batch["name"])
+
+    def test_auto_batch_stays_open_while_jobs_remain(self) -> None:
+        start = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
+        running = [{"id": "5", "name": "train", "state": "RUNNING", "exit_code": "", "elapsed": "1:00", "reason": "", "source": "squeue"}]
+        batch, _ready = update_auto_batch(None, running, start, 10, True)
+        batch, ready = update_auto_batch(batch, running, start + timedelta(hours=3), 10, True)
+        self.assertFalse(ready)
+
+    def test_auto_batch_ignores_a_down_scheduler(self) -> None:
+        start = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
+        running = [{"id": "5", "name": "train", "state": "RUNNING", "exit_code": "", "elapsed": "1:00", "reason": "", "source": "squeue"}]
+        batch, _ready = update_auto_batch(None, running, start, 10, True)
+        kept, ready = update_auto_batch(batch, [], start + timedelta(hours=1), 10, False)
+        self.assertIs(kept, batch)
+        self.assertFalse(ready)
+        self.assertEqual(kept["tasks"]["5"]["state"], "RUNNING")
 
 
 def main(argv: list[str] | None = None) -> int:

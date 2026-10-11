@@ -1,150 +1,46 @@
 # jobnotify
 
-`jobnotify` watches a named set of jobs and sends one message when the whole set has finished. Use it after `sbatch`, or after starting a local command, so you can come back and read the results instead of polling the queue.
+`jobnotify` watches your Slurm queue and sends one ntfy message when a batch of jobs has finished. Agents do not register job ids. The checker notices jobs by itself.
 
-The checker runs on the machine where the jobs run. It uses only the Python standard library.
-
-The minute-by-minute checker is installed once per machine. Each experiment still needs one `jobnotify watch` so the alert can name that set of jobs. Jobs that were never registered do not send a message.
-
-## For an agent on a new server
-
-1. Clone and install:
-
-```bash
-git clone git@github.com:aboots/jobnotify.git
-cd jobnotify
-./install.sh
-```
-
-2. A fresh `~/.config/jobnotify/config.env` has no channel, so install alone does not deliver alerts. Reuse the existing `NTFY_SERVER` and `NTFY_TOPIC` from a machine that already notifies this user. Copy those two lines only. Create a new topic only when the user asks, and then give them the `https://ntfy.sh/<topic>` URL so they can subscribe.
-3. Keep `config.env` mode `600`. Do not commit it, and do not write the topic into the repo.
-4. `jobnotify channels` must show at least one ready channel. `jobnotify test` must succeed before you rely on it.
-5. After every `sbatch`, register that experiment once. The timer is already running; do not reinstall per experiment.
-
-```bash
-jobnotify watch JOBID [JOBID ...] --name "short protocol name"
-jobnotify list
-```
-
-6. One alert is sent when every registered id in that name has finished. Adding later ids to the same name keeps them in the same alert.
+It uses only the Python standard library. The repository contains no tokens, topics, or account details. Each server creates its own private ntfy topic during install and prints a link.
 
 ## Install
 
 ```bash
-git clone git@github.com:aboots/jobnotify.git
+git clone https://github.com/aboots/jobnotify.git
 cd jobnotify
 ./install.sh
 ```
 
-This copies the command to `~/.local/bin/jobnotify`, creates `~/.config/jobnotify/config.env` the first time, and starts a user systemd timer that checks every minute.
+`install.sh` prints one URL. Give that URL to the user. That is the only server-specific secret, and it stays in `~/.config/jobnotify/config.env` with mode `600`.
 
-Logout keeps the timer running when lingering is enabled. If this machine cannot enable lingering, the checker runs while you still have a login session. A cron line that does the same thing is:
+## Add the link in the ntfy app
 
-```bash
-* * * * * $HOME/.local/bin/jobnotify check
-```
+1. Install ntfy from the App Store, Play Store, or F-Droid.
+2. Open the app and tap **+**.
+3. Choose **Subscribe to topic**.
+4. Paste the full `https://ntfy.sh/...` link, or only the topic name after the slash.
+5. Confirm. A test message can be sent with `jobnotify test`.
 
-## Choose a channel
+Opening the same link in the phone browser also offers to subscribe in the app.
 
-Edit `~/.config/jobnotify/config.env` and fill in one or more channels. `jobnotify channels` shows what is ready. `jobnotify test` sends a test message.
+## What it does
 
-### Phone push
+A user timer runs `jobnotify check` every minute. Each check is one local `squeue` lookup.
 
-Install [ntfy](https://ntfy.sh) on your phone, or open the topic in a browser. Put a long random topic in the config:
+When jobs are pending or running, they belong to the current batch. Jobs that appear later join that same batch. The batch is ready only after both of these are true:
 
-```bash
-NTFY_SERVER=https://ntfy.sh
-NTFY_TOPIC=replace-with-a-long-random-string
-```
+- no new job has appeared for 10 minutes (`AUTO_QUIET_MINUTES`)
+- the queue no longer has pending or running jobs
 
-Subscribe to that same topic. Anyone who knows the topic can read the alerts, so keep the config file private (`chmod 600`).
+One message then names the host and the job states. It does not include logs, metrics, or file paths beyond the job name. The next time jobs appear, a new batch starts.
 
-### Telegram
+`jobnotify list` shows the current batch. `jobnotify link` prints the subscribe URL again.
 
-Create a bot with [@BotFather](https://t.me/BotFather), then send any message to that bot. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. The chat id is the `id` field from `https://api.telegram.org/bot<token>/getUpdates`.
+## For an agent on a new server
 
-### Gmail
-
-Create an app password in Google Account, Security, App passwords. Gmail rejects the normal account password for SMTP.
-
-```bash
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_SECURITY=starttls
-SMTP_USER=you@gmail.com
-SMTP_PASSWORD=the-app-password
-SMTP_FROM=you@gmail.com
-SMTP_TO=you@gmail.com
-```
-
-Any other SMTP server uses the same keys.
-
-### WhatsApp
-
-[CallMeBot](https://www.callmebot.com/blog/free-api-whatsapp-messages/) gives a small API key. Put this in `WEBHOOK_URL`, with your phone number and key:
-
-```bash
-WEBHOOK_URL=https://api.callmebot.com/whatsapp.php?phone=1XXXXXXXXXX&apikey=YOURKEY&text={message}
-```
-
-A webhook without `{message}` receives a JSON `POST` of `{"title", "body"}`.
-
-## Watch a protocol
-
-Give every experiment a name. The alert includes that name, the host, and each job's state.
-
-```bash
-jobnotify watch 12345 12346 --name "V50 training"
-```
-
-Array jobs count as one id. Every task that is still visible to Slurm is part of the protocol. One message is sent when all of them have reached a final state.
-
-You can also submit and watch in one step:
-
-```bash
-jobnotify sbatch --name "V50 training" -- --parsable job.slurm
-```
-
-Adding more ids to the same name keeps them in the same protocol:
-
-```bash
-jobnotify watch 12347 --name "V50 training"
-```
-
-`jobnotify list` shows what is still open. `jobnotify forget "V50 training"` drops it.
-
-A local command works on machines without Slurm:
-
-```bash
-jobnotify run --name "local eval" -- python evaluate.py
-jobnotify run --detach --name "local train" -- python train.py
-```
-
-## What the message says
-
-A clean finish looks like:
-
-```text
-Jobs finished: V50 training
-Host: your-server
-3 completed
-
-  12345  train  COMPLETED  01:12:03  exit 0:0
-  ...
-Come check the results.
-```
-
-If a job fails while others are still running, one early message is sent. When the rest finish, the final message is sent. Cancelled tasks are listed in the final message and do not send the early warning by themselves.
-
-The message has job ids and states. It does not include logs, metrics, or file contents.
-
-On a cluster whose accounting database is down, states come from the live scheduler. A job that disappears before its exit code is recorded is reported as `LEFT_QUEUE`.
-
-## Update
-
-```bash
-git pull
-./install.sh
-```
-
-Existing `config.env` is left in place.
+1. Clone the public repository and run `./install.sh`.
+2. Copy the printed `https://ntfy.sh/...` URL into the reply so the user can subscribe.
+3. Do not commit `~/.config/jobnotify/config.env` and do not paste the topic into this repository.
+4. Do not register individual Slurm ids. Submitting jobs is enough.
+5. `jobnotify test` should succeed after the topic exists.

@@ -1,0 +1,7 @@
+[Unit]
+Description=Check watched jobs and send a finish notification
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/jobnotify check
+Nice=10
